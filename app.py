@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import re
 
 import pandas as pd
 import streamlit as st
@@ -34,6 +35,11 @@ with col_b:
         "Show OCR source text",
         value=False,
     )
+
+
+def _year_from_filename(filename):
+    matches = re.findall(r"\b(?:19|20)\d{2}\b", filename or "")
+    return int(matches[-1]) if matches else None
 
 
 def _ics_escape(value):
@@ -124,6 +130,19 @@ def build_ics(entries):
 
 if uploaded_file is not None:
     pdf_bytes = uploaded_file.read()
+    detected_year = _year_from_filename(uploaded_file.name)
+
+    year_value = st.number_input(
+        "Schedule year",
+        min_value=1900,
+        max_value=2100,
+        value=detected_year or datetime.now().year,
+        step=1,
+        help=(
+            "Used when the syllabus lists dates without a year. "
+            "The uploaded filename year is detected automatically when present."
+        ),
+    )
 
     try:
         pages = convert_from_bytes(pdf_bytes)
@@ -147,7 +166,10 @@ if uploaded_file is not None:
             )
 
         try:
-            entries = extract_date_bounded_schedule(page_image)
+            entries = extract_date_bounded_schedule(
+                page_image,
+                year_hint=int(year_value),
+            )
         except Exception as exc:
             st.error(f"OCR failed on page {page_number}.")
             st.exception(exc)

@@ -22,6 +22,25 @@ DATE_RANGE_RE = re.compile(
 SINGLE_DATE_RE = re.compile(
     r"(?<![\d/])(?P<m>\d{1,2})\s*[-/]\s*(?P<d>\d{1,2})(?!\s*[-/]\s*\d{1,4})"
 )
+MONTH_NAME_PATTERN = (
+    r"January|February|March|April|May|June|July|August|"
+    r"September|October|November|December|"
+    r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec"
+)
+MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2,
+    "mar": 3, "march": 3, "apr": 4, "april": 4, "may": 5,
+    "jun": 6, "june": 6, "jul": 7, "july": 7, "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9, "oct": 10, "october": 10,
+    "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+MONTH_DATE_RE = re.compile(
+    rf"\b(?P<month>{MONTH_NAME_PATTERN})\.?\s+(?P<day>\d{{1,2}})"
+    rf"(?:\s*,\s*(?P<year>\d{{4}}))?"
+    rf"(?:\s*[-–—]\s*(?:(?P<end_month>{MONTH_NAME_PATTERN})\.?\s+)?"
+    rf"(?P<end_day>\d{{1,2}})(?:\s*,\s*(?P<end_year>\d{{4}}))?)?\b",
+    re.IGNORECASE,
+)
 YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 WEEK_RE = re.compile(r"\bWeek\s*(\d+)\b", re.I)
 
@@ -187,10 +206,96 @@ def _parse_dates(text: str) -> List[Dict]:
     return sorted(results, key=lambda x: x["start"])
 
 
-def _find_year(lines: List[Dict]) -> Optional[int]:
+def _parse_month_dates(text: str) -> List[Dict]:
+    text = _clean_text(text)
+    results = []
+
+    for match in MONTH_DATE_RE.finditer(text):
+        month_name = match.group("month").lower().rstrip(".")
+        end_month_name = match.group("end_month")
+        start_month = MONTHS.get(month_name)
+        end_month = MONTHS.get(end_month_name.lower().rstrip(".")) if end_month_name else start_month
+
+        if not start_month:
+            continue
+
+        start_day = int(match.group("day"))
+        end_day = int(match.group("end_day")) if match.group("end_day") else start_day
+        if not (1 <= start_day <= 31 and 1 <= end_day <= 31):
+            continue
+
+        results.append({
+            "start_month": start_month,
+            "start_day": start_day,
+            "end_month": end_month,
+            "end_day": end_day,
+            "text": _clean_text(match.group(0)),
+            "start": match.start(),
+            "end": match.end(),
+            "explicit_year": int(match.group("year")) if match.group("year") else None,
+            "explicit_end_year": int(match.group("end_year")) if match.group("end_year") else None,
+        })
+
+    return results
+
+
+def _extract_narrative_schedule(lines: List[Dict], year_hint: Optional[int]) -> List[Dict]:
+    candidates = []
+
+    for line_index, line in enumerate(lines):
+        dates = _parse_month_dates(line["text"])
+        if not dates:
+            continue
+
+        first = dates[0]
+        # Narrative schedule dates are normally at the beginning of the line.
+        # This avoids treating phrases such as "chapters 1-25" as dates.
+        prefix = line["text"][:first["start"]].strip(" -:")
+        if prefix and len(prefix) > 12:
+            continue
+        candidates.append((line_index, first))
+
+    if len(candidates) < 2:
+        return []
+
+    results = []
+
+    for index, (line_index, parsed) in enumerate(candidates):
+        next_index = candidates[index + 1][0] if index + 1 < len(candidates) else len(lines)
+        block_lines = lines[line_index:next_index]
+        block_text = "\n".join(line["text"] for line in block_lines)
+        events = _extract_events(block_text)
+        if not events:
+            continue
+
+        start_date, end_date = _iso_dates(parsed, year_hint)
+        start_time, end_time, room = _extract_time_info(block_text)
+
+        for event in events:
+            notes = event["notes"]
+            if room and f"Room {room}" not in notes:
+                notes = f"{notes} Room {room}".strip()
+
+            results.append({
+                "week": None,
+                "date_range": parsed["text"],
+                "start_date": start_date,
+                "end_date": end_date,
+                "start_time": start_time,
+                "end_time": end_time,
+                "event_type": event["event_type"],
+                "title": event["title"],
+                "notes": notes,
+                "source_text": block_text,
+            })
+
+    return results
+
+
+def _find_year(lines: List[Dict], year_hint: Optional[int] = None) -> Optional[int]:
     text = "\n".join(line["text"] for line in lines)
     years = YEAR_RE.findall(text)
-    return int(years[0]) if years else None
+    return int(years[0]) if years else year_hint
 
 
 def _find_date_column_cluster(words: List[Dict]) -> Optional[Tuple[float, float]]:
@@ -260,9 +365,8 @@ def _find_schedule_start(lines: List[Dict]) -> int:
 def _looks_like_schedule_page(lines: List[Dict]) -> bool:
     text = " ".join(line["text"] for line in lines).lower()
 
-    date_count = 0
-    for line in lines:
-        date_count += len(_parse_dates(line["text"]))
+    numeric_dates = sum(len(_parse_dates(line["text"])) for line in lines)
+    month_dates = sum(len(_parse_month_dates(line["text"])) for line in lines)
 
     indicators = [
         "schedule",
@@ -276,11 +380,13 @@ def _looks_like_schedule_page(lines: List[Dict]) -> bool:
         "project",
         "test",
         "final",
+        "midterm",
+        "no class",
     ]
 
     hits = sum(1 for item in indicators if item in text)
 
-    return date_count >= 2 and hits >= 1
+    return (numeric_dates >= 2 or month_dates >= 2) and hits >= 1
 
 
 def _schedule_date_candidates(
@@ -404,33 +510,45 @@ def _extract_events(text: str) -> List[Dict]:
     text = _clean_text(text)
     events = []
 
-    source_matches = list(SOURCE_ASSIGNMENT_RE.finditer(text))
-    if source_matches:
-        for match in source_matches:
-            source = match.group("source").title()
-            number = match.group("number")
-            events.append({
-                "event_type": "assignment",
-                "title": f"{source} Assignment {number}",
-                "notes": text[max(0, match.start()):].strip(" -:;"),
-                "_pos": match.start(),
-            })
-    else:
-        for match in re.finditer(r"\bAssignment\s*#?\s*(\d+)\b", text, re.I):
-            events.append({
-                "event_type": "assignment",
-                "title": f"Assignment {match.group(1)}",
-                "notes": text[max(0, match.start()):].strip(" -:;"),
-                "_pos": match.start(),
-            })
-
-    for match in LAB_RE.finditer(text):
+    def add(event_type, title, match):
         events.append({
-            "event_type": "lab",
-            "title": f"Zybook Lab {match.group(1)}",
+            "event_type": event_type,
+            "title": title,
             "notes": text[max(0, match.start()):].strip(" -:;"),
             "_pos": match.start(),
         })
+
+    # Specific exam variants first.
+    for match in re.finditer(r"\bFinal\s+Exam\s+Part\s*(\d+)\b", text, re.I):
+        add("exam", f"Final Exam Part {match.group(1)}", match)
+
+    for match in re.finditer(r"\bMidterm\s+Exam\s+Part\s*(\d+)\b", text, re.I):
+        add("exam", f"Midterm Exam Part {match.group(1)}", match)
+
+    # If the source says only "MIDTERM EXAM Part" (as in one of the supplied
+    # syllabi), keep the wording rather than inventing a part number.
+    if not re.search(r"\bMidterm\s+Exam\s+Part\s*\d+\b", text, re.I):
+        for match in re.finditer(r"\bMidterm\s+Exam\s+Part\b", text, re.I):
+            add("exam", "Midterm Exam Part", match)
+
+    # Generic final/midterm exam, only when a more-specific match didn't fire.
+    specific_final = re.search(r"\bFinal\s+Exam\s+Part\s*\d+\b", text, re.I)
+    if not specific_final:
+        for match in FINAL_EXAM_RE.finditer(text):
+            add("exam", "Final Exam", match)
+
+    specific_midterm = re.search(r"\bMidterm\s+Exam\s+Part\s*\d+\b", text, re.I)
+    if not specific_midterm and not re.search(r"\bMidterm\s+Exam\s+Part\b", text, re.I):
+        for match in MIDTERM_RE.finditer(text):
+            add("exam", "Midterm Exam", match)
+
+    for match in SOURCE_ASSIGNMENT_RE.finditer(text):
+        source = match.group("source").title()
+        number = match.group("number")
+        add("assignment", f"{source} Assignment {number}", match)
+
+    for match in LAB_RE.finditer(text):
+        add("lab", f"Zybook Lab {match.group(1)}", match)
 
     for pattern, kind, label in [
         (PROJECT_RE, "project", "Project"),
@@ -438,57 +556,33 @@ def _extract_events(text: str) -> List[Dict]:
         (TEST_RE, "test", "Test"),
     ]:
         for match in pattern.finditer(text):
-            events.append({
-                "event_type": kind,
-                "title": f"{label} {match.group(1)}",
-                "notes": text[max(0, match.start()):].strip(" -:;"),
-                "_pos": match.start(),
-            })
+            add(kind, f"{label} {match.group(1)}", match)
 
-    for pattern, kind, label in [
-        (FINAL_EXAM_RE, "exam", "Final Exam"),
-        (MIDTERM_RE, "exam", "Midterm Exam"),
-    ]:
-        for match in pattern.finditer(text):
-            events.append({
-                "event_type": kind,
-                "title": label,
-                "notes": text[max(0, match.start()):].strip(" -:;"),
-                "_pos": match.start(),
-            })
-
-    if not any(event["event_type"] == "exam" for event in events):
-        for match in EXAM_RE.finditer(text):
-            events.append({
-                "event_type": "exam",
-                "title": "Exam",
-                "notes": text[max(0, match.start()):].strip(" -:;"),
-                "_pos": match.start(),
-            })
-
-    # A standalone "Final" is useful for table schedules like the reference
-    # syllabus, but is suppressed when "Final Exam" already matched.
-    if not any(event["title"] == "Final Exam" for event in events):
-        for match in FINAL_RE.finditer(text):
-            events.append({
-                "event_type": "final",
-                "title": "Final",
-                "notes": text[max(0, match.start()):].strip(" -:;"),
-                "_pos": match.start(),
-            })
-
+    # Holiday rows should become calendar events.
+    holiday_found = False
     for title, pattern in HOLIDAYS:
         for match in pattern.finditer(text):
-            events.append({
-                "event_type": "holiday",
-                "title": title,
-                "notes": text[max(0, match.start()):].strip(" -:;"),
-                "_pos": match.start(),
-            })
+            holiday_found = True
+            add("holiday", title, match)
 
-    # One calendar event per title/type/date band.
-    seen = set()
+    # Generic no-class rows are important in narrative schedules.
+    if not holiday_found:
+        for match in re.finditer(r"\bNo\s+class\b", text, re.I):
+            add("no_class", "No Class", match)
+
+    # A standalone exam fallback.
+    if not any(event["event_type"] == "exam" for event in events):
+        for match in EXAM_RE.finditer(text):
+            add("exam", "Exam", match)
+
+    # A standalone Final row is useful for table schedules. Avoid turning
+    # "Final Exam" into an extra Final event.
+    if not re.search(r"\bFinal\s+Exam\b", text, re.I):
+        for match in FINAL_RE.finditer(text):
+            add("final", "Final", match)
+
     cleaned = []
+    seen = set()
     for event in sorted(events, key=lambda e: e["_pos"]):
         key = (event["event_type"], event["title"])
         if key in seen:
@@ -501,12 +595,15 @@ def _extract_events(text: str) -> List[Dict]:
 
 
 def _iso_dates(parsed: Dict, year: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
+    year = parsed.get("explicit_year") or year
     if year is None:
         return None, None
 
     try:
         start = date(year, parsed["start_month"], parsed["start_day"])
-        end_year = year + 1 if parsed["end_month"] < parsed["start_month"] else year
+        end_year = parsed.get("explicit_end_year") or (
+            year + 1 if parsed["end_month"] < parsed["start_month"] else year
+        )
         end = date(end_year, parsed["end_month"], parsed["end_day"])
         return start.isoformat(), end.isoformat()
     except ValueError:
@@ -528,14 +625,52 @@ def _extract_time_info(text: str) -> Tuple[Optional[str], Optional[str], Optiona
     return start, end, room
 
 
-def extract_date_bounded_schedule(image: Image.Image) -> List[Dict]:
+def _dedupe_results(results: List[Dict]) -> List[Dict]:
+    final = []
+    seen = set()
+
+    for entry in results:
+        key = (
+            entry.get("start_date"),
+            entry.get("end_date"),
+            entry.get("event_type"),
+            entry.get("title"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        final.append(entry)
+
+    final.sort(
+        key=lambda e: (
+            e.get("start_date") or "9999-99-99",
+            e.get("start_time") or "99:99",
+            e.get("title") or "",
+        )
+    )
+    return final
+
+
+def extract_date_bounded_schedule(
+    image: Image.Image,
+    year_hint: Optional[int] = None,
+) -> List[Dict]:
     words = _ocr_data(image, psm=4)
     lines = _group_lines(words, y_tolerance=10)
 
     if not _looks_like_schedule_page(lines):
         return []
 
-    year = _find_year(lines)
+    year = _find_year(lines, year_hint)
+
+    # Some syllabi use a narrative course schedule rather than a bordered
+    # Date/Activity table. Handle month-name dates before the table parser.
+    month_date_count = sum(len(_parse_month_dates(line["text"])) for line in lines)
+    if month_date_count >= 2:
+        narrative = _extract_narrative_schedule(lines, year)
+        if narrative:
+            return _dedupe_results(narrative)
+
     candidates = _schedule_date_candidates(image, words, lines)
 
     if not candidates:
@@ -620,30 +755,7 @@ def extract_date_bounded_schedule(image: Image.Image) -> List[Dict]:
                     "source_text": band_text,
                 })
 
-    # Exact duplicates only.
-    final = []
-    seen = set()
-
-    for entry in results:
-        key = (
-            entry["start_date"],
-            entry["end_date"],
-            entry["event_type"],
-            entry["title"],
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        final.append(entry)
-
-    final.sort(
-        key=lambda e: (
-            e["start_date"] or "9999-99-99",
-            e["title"],
-        )
-    )
-
-    return final
+    return _dedupe_results(results)
 
 
 # Backwards-compatible helpers used by earlier versions of the app.
