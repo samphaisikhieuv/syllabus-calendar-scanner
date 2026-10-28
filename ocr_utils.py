@@ -44,11 +44,6 @@ MONTH_DATE_RE = re.compile(
 YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 WEEK_RE = re.compile(r"\bWeek\s*(\d+)\b", re.I)
 
-SOURCE_ASSIGNMENT_RE = re.compile(
-    r"\b(?P<source>zybook|handout)\s+assignment\s*#?\s*(?P<number>\d+)\b",
-    re.I,
-)
-LAB_RE = re.compile(r"\bZybook\s+Lab\s*#?\s*(\d+)\b", re.I)
 PROJECT_RE = re.compile(r"\bProject\s*#?\s*(\d+)\b", re.I)
 QUIZ_RE = re.compile(r"\bQuiz\s*#?\s*(\d+)\b", re.I)
 TEST_RE = re.compile(r"\bTest\s*#?\s*(\d+)\b", re.I)
@@ -239,7 +234,11 @@ def _parse_month_dates(text: str) -> List[Dict]:
     return results
 
 
-def _extract_narrative_schedule(lines: List[Dict], year_hint: Optional[int]) -> List[Dict]:
+def _extract_narrative_schedule(
+    lines: List[Dict],
+    year_hint: Optional[int],
+    custom_keywords: Optional[List[str]] = None,
+) -> List[Dict]:
     candidates = []
 
     for line_index, line in enumerate(lines):
@@ -264,7 +263,24 @@ def _extract_narrative_schedule(lines: List[Dict], year_hint: Optional[int]) -> 
         next_index = candidates[index + 1][0] if index + 1 < len(candidates) else len(lines)
         block_lines = lines[line_index:next_index]
         block_text = "\n".join(line["text"] for line in block_lines)
-        events = _extract_events(block_text)
+        events = _extract_events(block_text, custom_keywords)
+        if not events:
+            # Narrative schedules often list a reading or topic without an
+            # assignment keyword (for example, a book title after the date).
+            # Keep that dated item as a general class/reading event rather
+            # than requiring a syllabus-specific vocabulary list.
+            first_line = lines[line_index]["text"]
+            item_text = first_line[parsed["end"]:].strip(" \t-:;—–")
+            item_text = re.sub(r"\s+", " ", item_text).strip()
+            if item_text and not re.fullmatch(r"(?:week\s+\d+|\d+)\b", item_text, re.I):
+                item_type = "reading" if re.search(
+                    r"\b(read|reading|chapter|pages?|text|book)\b", item_text, re.I
+                ) else "class"
+                events = [{
+                    "event_type": item_type,
+                    "title": item_text[:120],
+                    "notes": item_text,
+                }]
         if not events:
             continue
 
@@ -506,9 +522,17 @@ def _week_for_date(
     return previous_week
 
 
-def _extract_events(text: str) -> List[Dict]:
+def _extract_events(
+    text: str,
+    custom_keywords: Optional[List[str]] = None,
+) -> List[Dict]:
     text = _clean_text(text)
     events = []
+    normalized_keywords = []
+    for keyword in custom_keywords or []:
+        keyword = keyword.strip()
+        if keyword and keyword.casefold() not in {k.casefold() for k in normalized_keywords}:
+            normalized_keywords.append(keyword)
 
     def add(event_type, title, match):
         events.append({
@@ -516,6 +540,7 @@ def _extract_events(text: str) -> List[Dict]:
             "title": title,
             "notes": text[max(0, match.start()):].strip(" -:;"),
             "_pos": match.start(),
+            "_end": match.end(),
         })
 
     # Specific exam variants first.
@@ -542,14 +567,6 @@ def _extract_events(text: str) -> List[Dict]:
         for match in MIDTERM_RE.finditer(text):
             add("exam", "Midterm Exam", match)
 
-    for match in SOURCE_ASSIGNMENT_RE.finditer(text):
-        source = match.group("source").title()
-        number = match.group("number")
-        add("assignment", f"{source} Assignment {number}", match)
-
-    for match in LAB_RE.finditer(text):
-        add("lab", f"Zybook Lab {match.group(1)}", match)
-
     for pattern, kind, label in [
         (PROJECT_RE, "project", "Project"),
         (QUIZ_RE, "quiz", "Quiz"),
@@ -557,6 +574,37 @@ def _extract_events(text: str) -> List[Dict]:
     ]:
         for match in pattern.finditer(text):
             add(kind, f"{label} {match.group(1)}", match)
+
+    # Keep common event terms useful even when the syllabus omits a number.
+    core_pattern = re.compile(
+        r"\b(?P<term>homework|assignment|test|quiz|exam|project|lab)\b"
+        r"(?:\s*(?:#|no\.?\s*)?(?P<number>\d+))?",
+        re.I,
+    )
+    for match in core_pattern.finditer(text):
+        if any(
+            match.start() < event["_end"] and match.end() > event["_pos"]
+            for event in events
+        ):
+            continue
+        term = match.group("term").lower()
+        event_type = "assignment" if term in {"homework", "assignment"} else term
+        title = term.title()
+        if match.group("number"):
+            title += f" {match.group('number')}"
+        add(event_type, title, match)
+        for keyword in normalized_keywords:
+            prefix_start = max(text.rfind("\n", 0, match.start()), match.start() - 40)
+            prefix = text[prefix_start:match.start()]
+            source_match = re.search(
+                rf"(?<!\w){re.escape(keyword)}(?!\w)[ \t]*$", prefix, re.I
+            )
+            if source_match:
+                source_start = prefix_start + source_match.start()
+                events[-1]["title"] = f"{source_match.group(0).strip()} {title}"
+                events[-1]["notes"] = text[source_start:].strip(" -:;")
+                events[-1]["_pos"] = source_start
+                break
 
     # Holiday rows should become calendar events.
     holiday_found = False
@@ -581,6 +629,23 @@ def _extract_events(text: str) -> List[Dict]:
         for match in FINAL_RE.finditer(text):
             add("final", "Final", match)
 
+    # User-defined search terms make syllabus-specific labels configurable.
+    # Existing recognized events take precedence when a custom match points
+    # to the same text, avoiding duplicate entries such as Zybook Assignment 1.
+    for keyword in normalized_keywords:
+        pattern = re.compile(rf"(?<!\w){re.escape(keyword)}(?!\w)", re.I)
+        for match in pattern.finditer(text):
+            overlaps_existing = any(
+                (
+                    match.start() < event["_end"]
+                    and match.end() > event["_pos"]
+                )
+                or abs(match.start() - event["_pos"]) <= 40
+                for event in events
+            )
+            if not overlaps_existing:
+                add("keyword", keyword, match)
+
     cleaned = []
     seen = set()
     for event in sorted(events, key=lambda e: e["_pos"]):
@@ -589,6 +654,7 @@ def _extract_events(text: str) -> List[Dict]:
             continue
         seen.add(key)
         event.pop("_pos", None)
+        event.pop("_end", None)
         cleaned.append(event)
 
     return cleaned
@@ -654,6 +720,7 @@ def _dedupe_results(results: List[Dict]) -> List[Dict]:
 def extract_date_bounded_schedule(
     image: Image.Image,
     year_hint: Optional[int] = None,
+    custom_keywords: Optional[List[str]] = None,
 ) -> List[Dict]:
     words = _ocr_data(image, psm=4)
     lines = _group_lines(words, y_tolerance=10)
@@ -667,7 +734,7 @@ def extract_date_bounded_schedule(
     # Date/Activity table. Handle month-name dates before the table parser.
     month_date_count = sum(len(_parse_month_dates(line["text"])) for line in lines)
     if month_date_count >= 2:
-        narrative = _extract_narrative_schedule(lines, year)
+        narrative = _extract_narrative_schedule(lines, year, custom_keywords)
         if narrative:
             return _dedupe_results(narrative)
 
@@ -727,7 +794,7 @@ def extract_date_bounded_schedule(
         if week is not None:
             previous_week = week
 
-        events = _extract_events(band_text)
+        events = _extract_events(band_text, custom_keywords)
         if not events:
             continue
 
