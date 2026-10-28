@@ -149,6 +149,11 @@ else:
                 continue
             all_results.extend({"page": page_number, **entry} for entry in entries)
 
+        st.divider()
+        st.subheader("Add entries to this scan")
+        manual_results = render_manual_mode()
+        all_results.extend(manual_results)
+
 if not all_results:
     if mode == "Automatic scan" and 'uploaded_file' in locals() and uploaded_file is not None:
         st.warning("No calendar events were detected. Turn on the debugging options above and try again.")
