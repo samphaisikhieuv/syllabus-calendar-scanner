@@ -378,7 +378,10 @@ def _find_schedule_start(lines: List[Dict]) -> int:
     return 0
 
 
-def _looks_like_schedule_page(lines: List[Dict]) -> bool:
+def _looks_like_schedule_page(
+    lines: List[Dict],
+    custom_keywords: Optional[List[str]] = None,
+) -> bool:
     text = " ".join(line["text"] for line in lines).lower()
 
     numeric_dates = sum(len(_parse_dates(line["text"])) for line in lines)
@@ -401,8 +404,13 @@ def _looks_like_schedule_page(lines: List[Dict]) -> bool:
     ]
 
     hits = sum(1 for item in indicators if item in text)
+    has_custom_keyword = any(
+        keyword.strip()
+        and re.search(rf"(?<!\w){re.escape(keyword.strip())}(?!\w)", text, re.I)
+        for keyword in custom_keywords or []
+    )
 
-    return (numeric_dates >= 2 or month_dates >= 2) and hits >= 1
+    return (numeric_dates >= 2 or month_dates >= 2) and (hits >= 1 or has_custom_keyword)
 
 
 def _schedule_date_candidates(
@@ -725,7 +733,7 @@ def extract_date_bounded_schedule(
     words = _ocr_data(image, psm=4)
     lines = _group_lines(words, y_tolerance=10)
 
-    if not _looks_like_schedule_page(lines):
+    if not _looks_like_schedule_page(lines, custom_keywords):
         return []
 
     year = _find_year(lines, year_hint)
